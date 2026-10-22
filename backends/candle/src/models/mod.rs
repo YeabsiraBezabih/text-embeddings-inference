@@ -11,6 +11,10 @@ mod bert;
 mod debertav2;
 mod dense;
 mod distilbert;
+pub mod embedding_gemma2;
+pub mod gemma4_audio;
+pub mod gemma4_vision;
+pub mod multimodal_preprocessing;
 mod gemma3;
 mod gte;
 mod jina;
@@ -58,6 +62,9 @@ pub use bert::{BertConfig, BertModel, PositionEmbeddingType};
 pub use debertav2::{DebertaV2Config, DebertaV2Model};
 pub use dense::{Dense, DenseConfig, DenseLayer};
 pub use distilbert::{DistilBertConfig, DistilBertModel};
+pub use embedding_gemma2::{
+    EmbeddingGemma2Config, EmbeddingGemma2ConfigWrapper, EmbeddingGemma2Model,
+};
 pub use gemma3::{Gemma3Config, Gemma3Model};
 pub use gte::{GTEConfig, GTEModel};
 pub use jina::JinaBertModel;

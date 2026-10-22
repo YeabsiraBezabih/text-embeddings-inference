@@ -4,7 +4,7 @@ mod compute_cap;
 #[cfg(feature = "cuda")]
 mod flash_attn;
 mod layers;
-mod models;
+pub mod models;
 
 use anyhow::Context;
 use candle::{DType, Device};
@@ -23,7 +23,8 @@ use crate::compute_cap::{
 };
 use crate::models::{
     BertConfig, BertModel, DebertaV2Config, DebertaV2Model, Dense, DenseConfig, DenseLayer,
-    DistilBertConfig, DistilBertModel, GTEConfig, GTEModel, Gemma3Config, Gemma3Model,
+    DistilBertConfig, DistilBertModel, EmbeddingGemma2ConfigWrapper,
+    EmbeddingGemma2Model, GTEConfig, GTEModel, Gemma3Config, Gemma3Model,
     JinaBertModel, JinaCodeBertModel, LlamaConfig, MPNetConfig, MPNetModel, MistralConfig, Model,
     ModernBertConfig, ModernBertModel, NomicBertModel, NomicConfig, Pplx1Config, Pplx1Model,
     Qwen2Config, Qwen3Config, Qwen3Model,
@@ -131,6 +132,9 @@ enum Config {
     DistilBert(DistilBertConfig),
     #[serde(rename(deserialize = "gemma3_text"))]
     Gemma3(Gemma3Config),
+    #[serde(rename(deserialize = "embedding_gemma2"))]
+    #[serde(alias = "embedding_gemma2_text")]
+    EmbeddingGemma2(EmbeddingGemma2ConfigWrapper),
     #[serde(alias = "new")]
     Gte(GTEConfig),
     #[serde(rename = "mpnet")]
@@ -330,6 +334,17 @@ impl CandleBackend {
                     Ok(Box::new(Gemma3Model::load(vb, &config, model_type).s()?))
                 }
             }
+            (Config::EmbeddingGemma2(wrapper), Device::Cpu | Device::Metal(_)) => {
+                let config = wrapper.into_inner();
+                if dtype != DType::F32 {
+                    Err(BackendError::Start(
+                        "EmbeddingGemma2 is only supported in fp32 precision".to_string(),
+                    ))
+                } else {
+                    tracing::info!("Starting EmbeddingGemma2 model on {:?}", device);
+                    Ok(Box::new(EmbeddingGemma2Model::load(vb, &config, model_type).s()?))
+                }
+            }
             (Config::Gte(config), Device::Cpu | Device::Metal(_)) => {
                 tracing::info!("Starting GTE model on {:?}", device);
                 Ok(Box::new(GTEModel::load(vb, &config, model_type).s()?))
@@ -461,6 +476,18 @@ impl CandleBackend {
                 } else {
                     tracing::info!("Starting Gemma3 model on {:?}", device);
                     Ok(Box::new(Gemma3Model::load(vb, &config, model_type).s()?))
+                }
+            }
+            #[cfg(feature = "cuda")]
+            (Config::EmbeddingGemma2(wrapper), Device::Cuda(_)) => {
+                let config = wrapper.into_inner();
+                if dtype != DType::F32 {
+                    Err(BackendError::Start(
+                        "EmbeddingGemma2 is only supported in fp32 precision".to_string(),
+                    ))
+                } else {
+                    tracing::info!("Starting EmbeddingGemma2 model on {:?}", device);
+                    Ok(Box::new(EmbeddingGemma2Model::load(vb, &config, model_type).s()?))
                 }
             }
             #[cfg(feature = "cuda")]

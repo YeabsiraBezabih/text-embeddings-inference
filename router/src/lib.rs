@@ -118,6 +118,15 @@ pub async fn run(
 
     // Set model type from config
     let backend_model_type = get_backend_model_type(&config, &model_root, pooling)?;
+    let pad_token_id = config.get_pad_token_id();
+    let is_gemma = config.is_gemma();
+    let max_position_embeddings = match config.get_max_position_embeddings() {
+        Some(max_position_embeddings) => max_position_embeddings,
+        None => match config.max_trained_positions {
+            Some(max_trained_positions) => max_trained_positions,
+            None => anyhow::bail!("At least any of `max_position_embeddings` or `max_trained_positions` (only applies for NomicBERT), in that order of priority, should be defined in `config.json`."),
+        },
+    };
 
     // Info model type
     let model_type = match &backend_model_type {
@@ -186,7 +195,7 @@ pub async fn run(
         || &config.model_type == "camembert"
         || &config.model_type == "roberta"
     {
-        config.pad_token_id.unwrap_or(0) + 1
+        pad_token_id.unwrap_or(0) + 1
     } else {
         0
     };
@@ -195,23 +204,18 @@ pub async fn run(
     let mut st_config: Option<STConfig> = None;
     for name in ST_CONFIG_NAMES {
         let config_path = model_root.join(name);
-        if let Ok(config) = fs::read_to_string(config_path) {
-            st_config =
-                Some(serde_json::from_str(&config).context(format!("Failed to parse `{}`", name))?);
-            break;
+        if let Ok(config_str) = fs::read_to_string(config_path) {
+            if let Ok(parsed) = serde_json::from_str::<STConfig>(&config_str) {
+                if parsed.max_seq_length.is_some() {
+                    st_config = Some(parsed);
+                    break;
+                }
+            }
         }
     }
 
-    let max_position_embeddings = match config.max_position_embeddings {
-        Some(max_position_embeddings) => max_position_embeddings,
-        None => match config.max_trained_positions {
-            Some(max_trained_positions) => max_trained_positions,
-            None => anyhow::bail!("At least any of `max_position_embeddings` or `max_trained_positions` (only applies for NomicBERT), in that order of priority, should be defined in `config.json`."),
-        },
-    };
-
-    let base_input_length = match st_config {
-        Some(config) => config.max_seq_length,
+    let base_input_length = match st_config.and_then(|c| c.max_seq_length) {
+        Some(max_seq_length) => max_seq_length,
         None => {
             tracing::warn!("Could not find a Sentence Transformers config");
             max_position_embeddings - position_offset
@@ -271,10 +275,8 @@ pub async fn run(
         prompts,
     );
 
-    // NOTE: `gemma3_text` won't support Float16 but only Float32, given that with `candle-cuda`
-    // feature, the default `Dtype::Float16` this overrides that to prevent issues when running a
-    // `gemma3_text` model without specifying a `--dtype`
-    let dtype = if dtype.is_none() && config.model_type == "gemma3_text" {
+    // NOTE: Gemma models won't support Float16 but only Float32 on candle-cuda / cpu
+    let dtype = if dtype.is_none() && is_gemma {
         DType::Float32
     } else {
         dtype.unwrap_or_default()
@@ -309,6 +311,15 @@ pub async fn run(
         )
         .await
         .context("Model backend is not healthy")?;
+
+    #[cfg(target_os = "linux")]
+    unsafe {
+        extern "C" {
+            fn malloc_trim(pad: usize) -> i32;
+        }
+        tracing::info!("Trimming heap memory arenas after warmup");
+        malloc_trim(0);
+    }
 
     let max_batch_requests = backend
         .max_batch_size
@@ -467,6 +478,7 @@ fn get_backend_model_type(
 
 #[derive(Debug, Deserialize)]
 pub struct ModelConfig {
+    #[serde(default)]
     pub architectures: Vec<String>,
     pub model_type: String,
     // NOTE: `max_trained_positions` is specific for NomicBERT when it required custom code, but
@@ -480,20 +492,52 @@ pub struct ModelConfig {
     pub id2label: Option<HashMap<String, String>>,
     pub label2id: Option<HashMap<String, usize>>,
     pub auto_map: Option<HashMap<String, String>>,
+    pub text_config: Option<Box<ModelConfig>>,
+}
+
+impl ModelConfig {
+    pub fn get_max_position_embeddings(&self) -> Option<usize> {
+        self.max_position_embeddings
+            .or_else(|| self.text_config.as_ref().and_then(|t| t.get_max_position_embeddings()))
+    }
+
+    pub fn get_pad_token_id(&self) -> Option<usize> {
+        self.pad_token_id
+            .or_else(|| self.text_config.as_ref().and_then(|t| t.get_pad_token_id()))
+    }
+
+    pub fn is_gemma(&self) -> bool {
+        self.model_type == "gemma3_text"
+            || self.model_type == "embedding_gemma2"
+            || self.model_type == "embedding_gemma2_text"
+            || self.text_config.as_ref().is_some_and(|t| t.is_gemma())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct PoolConfig {
+    #[serde(default)]
     pooling_mode_cls_token: bool,
+    #[serde(default)]
     pooling_mode_mean_tokens: bool,
     #[serde(default)]
     pooling_mode_lasttoken: bool,
+    #[serde(default)]
+    pooling_mode: Option<String>,
 }
 
 impl TryFrom<PoolConfig> for Pool {
     type Error = anyhow::Error;
 
     fn try_from(config: PoolConfig) -> std::result::Result<Self, Self::Error> {
+        if let Some(mode) = &config.pooling_mode {
+            match mode.to_lowercase().as_str() {
+                "mean" => return Ok(Pool::Mean),
+                "cls" => return Ok(Pool::Cls),
+                "lasttoken" | "last_token" => return Ok(Pool::LastToken),
+                _ => anyhow::bail!("Pooling mode {mode} is not supported"),
+            }
+        }
         if config.pooling_mode_cls_token {
             return Ok(Pool::Cls);
         }
@@ -509,7 +553,7 @@ impl TryFrom<PoolConfig> for Pool {
 
 #[derive(Debug, Deserialize)]
 pub struct STConfig {
-    pub max_seq_length: usize,
+    pub max_seq_length: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
